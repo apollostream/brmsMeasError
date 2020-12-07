@@ -1,0 +1,527 @@
+---
+title: "Missing Values in `brms` and Prior Predictive Checking in the Bayesian Workflow"
+author: "Michael L. Thompson"
+date: "12/7/2020"
+output: 
+  pdf_document:
+    toc: yes
+    toc_depth: 4
+linkcolor: red
+urlcolor: blue
+---
+
+```{r setup, include=FALSE}
+
+COMPUTATION <- TRUE
+
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width = 5,
+  fig.height = 4
+)
+```
+
+\newpage
+
+## Introduction
+
+I use **R** package `brms` in the graduate class on Bayesian Analysis that I teach in the Master of Science in Business Analytics program at the University of Cincinnati, Lindner College of Business.  In the course, I teach the "Bayesian Workflow" [popularized by Prof. Andrew Gelman](https://statmodeling.stat.columbia.edu/2020/11/10/bayesian-workflow/) of Columbia University:
+
+* Gabry, Jonah, Daniel Simpson, Aki Vehtari, Michael Betancourt, and Andrew Gelman. "Visualization in Bayesian workflow." *Journal of the Royal Statistical Society: Series A (Statistics in Society)* **182**, no. 2 (2019): 389-402. [DOI: 10.1111/rssa.12378](https://doi.org/10.1111/rssa.12378)
+
+* Gelman, Andrew, Aki Vehtari, Daniel Simpson, Charles C. Margossian, Bob Carpenter, Yuling Yao, Lauren Kennedy, Jonah Gabry, Paul-Christian Bürkner, and Martin Modrák. "Bayesian workflow." arXiv preprint [arXiv:2011.01808](https://arxiv.org/abs/2011.01808) (2020).
+
+The Bayesian Workflow emphasizes simulation of data using the generative probabilistic model that one specifies to solve a problem.  An important use of simulation is in "Prior Predictive Checking", in which one assesses the suitability of the priors specified in the Bayesian Analysis by the plausibility of the predicted responses that they produce.
+
+Also, I emphasize the power and flexibility of generative probabilistic models containing latent variables. These range across the following types of models:
+
+* Error-in-variable models -- e.g., for data with measurement error in the predictors
+
+* Models for data with missing values in either or both the responses and the predictors
+
+* Generalized linear models -- e.g., logistic regression, ordinal logistic, ranking models, binomial, and multinomial-logit models
+
+* Factor models including structural equation models (SEM).
+
+The introduction of latent variables makes prior and posterior predictive checking using package `brms` a bit tricky.
+
+## Primary Issue
+
+**Issue:** However, in the case of missing values in some of the response and predictor variables, package `brms` has a problem:  It produces predictions of incredible magnitude regardless of the specified priors for the problem.
+
+In this **R** Markdown document, I will demonstrate this and suggest a simple fix to the auto-generated **Stan** probabilistic program.
+
+## Preparation of the **R** Environment
+
+First, let's load the packages we need and define a few workhorse functions.
+
+```{r prep_env}
+
+library(magrittr)
+library(tidyverse)
+library(rstan)
+library(brms)
+```
+
+```{r def_func, include=FALSE}
+make_data <- function(
+  N           = 1000L, 
+  beta        = 2, 
+  sigma_y     = 0.1, 
+  p_missing_y = 0.1, 
+  p_missing_x = 0.0,
+  x_has_err   = FALSE,
+  sigma_x     = 0.1,
+  f_partition = c(train=N*0.6,test=N*0.2,validate=N*0.2),
+  rng_seed = 31
+){
+  
+  set.seed( rng_seed )
+
+  missing_y <- sample(
+    c(FALSE,TRUE),
+    size = N, 
+    replace = TRUE, 
+    prob = c(1-p_missing_y, p_missing_y)
+  )
+  # Mark x as missing, only if the y is NOT missing --
+  # and p_missing_x>0 -- AND x is chosen as missing.
+  missing_x <- rep(FALSE,N)
+  if(p_missing_x>0){
+    set_missing <- sample( 
+      which(!missing_y), 
+      size = ceiling(N*p_missing_x )
+    )
+    missing_x[set_missing] <- TRUE
+  }  
+  x_true <- rnorm(N,0,1)
+  if(x_has_err){
+    eps_x   <- rnorm(N,0,sigma_x)
+  } else {
+    sigma_x <- as.numeric(NA)
+    eps_x   <- 0
+  }
+  x_obs   <- x_true + eps_x
+  y_true  <- beta * x_true
+  eps_y   <- rnorm(N,0,sigma_y)
+  y_obs   <- y_true + eps_y
+  
+  sets <- c("train","test","validate")
+  df <- tibble(
+    x_true = x_true,
+    x      = ifelse(missing_x,as.numeric(NA),x_obs), 
+    y_true = y_true,
+    y      = ifelse(missing_y,as.numeric(NA),y_obs), 
+    eps_y  = eps_y,
+    eps_x  = eps_x,
+    set    = rep( sets ,f_partition),
+    sigma_x = sigma_x,
+    sigma_y = sigma_y,
+    beta    = beta
+  )
+  
+  results <- sets %>%
+    set_names(.,.) %>%
+    map( ~ filter( df, set == .x ) ) %>%
+    c( list( all = df ) )
+  
+  return( results )
+}
+
+plot_data <- function(df) {
+  ggplot(df, aes(x=x,y=y)) +
+    geom_point(size=4,color="blue",alpha=0.3, na.rm = TRUE) +
+    labs(
+      title = "Observed Data",
+      subtitle = sprintf(
+        "N = %d, N_obs = %d",
+        nrow(df),
+        length(which(!is.na(df$y)))
+      )
+    )
+}
+
+gamma_prior <- function(
+  mn = 1, 
+  sd_pct = 10, 
+  probs = c(0,0.025,0.5,0.975,1), 
+  digits = 3,
+  seed = NA
+){
+  # mn and sd_pct must be positive
+  # mn = sh/rt
+  # sd = (sd_pct/100)*mn = sqrt(sh/rt^2)
+  rt <- mn/((sd_pct/100)*mn)^2
+  sh <- rt*mn
+  
+  prior_txt <- sprintf("gamma( %.3g, %.3g )", sh, rt )
+  
+  # If asked for, compute the stats of a random sample with this prior
+  if(is.null(probs)){
+    stats <- NULL
+  } else {
+    if(!is.na(seed)){
+      set.seed(seed)
+    }
+    x <- rgamma( 1e6, shape = sh, rate = rt )
+    stats <- c(mn=mean(x),sd=sd(x),quantile(x,probs=probs))
+  }
+  return( list( prior = prior_txt, stats = signif( stats, digits ) ) )
+}
+
+
+```
+
+
+
+## Example Problem with Missing Values
+
+Here, we'll generate some data.
+
+
+```{r gen_data}
+
+rng_seed <- 42
+
+dlist <- make_data(N = 1000L, p_missing_x = 0.03, rng_seed = rng_seed)
+
+df_train <- dlist$train
+
+df_train %>% filter(is.na(y)) %>% print()
+
+summary(df_train)
+
+df_train %>% plot_data() %>% print()
+
+```
+
+## Model Specification
+
+```{r mod_spec, eval=COMPUTATION}
+# Base model: ignore error in predictor
+mod0_frm <-  bf( 
+  formula = y | mi() ~  x, 
+  family = gaussian(link = "identity")
+)
+
+get_prior( 
+  formula = mod0_frm,
+  data    = filter(df_train,!is.na(x))
+) %>% print()
+
+# Let's place a gamma prior on sigma. Our function `gamma_prior()`
+# allows us to specify a mean value for sigma and a standard deviation
+# in terms of what percentage of the mean we'd like it to be:
+sigma_prior_info <- gamma_prior( mn = 0.1, sd_pct = 50) %T>% print()
+
+priors0 <- c(
+  set_prior("lognormal(0.0,1.0)", class = "b", lb = 0 ),
+  set_prior("student_t(4,0,1)", class = "Intercept" ),
+  set_prior( sigma_prior_info$prior, class = "sigma" )
+) %T>% print()
+
+```
+
+### Prior Predictive Checking
+
+Now, let's attempt to perform prior predictive checking. 
+
+#### Prior Predictive Simulation
+
+First, we simulate values (i.e. "fake data") from the priors.
+
+```{r pri_sim, eval = COMPUTATION}
+
+mod0_sim <- suppressMessages(
+  suppressWarnings(
+    brm(
+      formula = mod0_frm,
+      data    = filter(df_train,!is.na(x)),
+      prior   = priors0,
+      chain   = 1,
+      sample_prior = "only",
+      warmup  = 1000,
+      iter    = 2000,
+      seed    = rng_seed + 0,
+      save_pars = save_pars( latent = TRUE )
+    )    
+  )
+)
+```
+
+```{r prnt_sim, eval = COMPUTATION}
+print( mod0_sim, priors = TRUE, digits = 4 )
+```
+
+The printed summary of the simulation results all look reasonable relative to the priors we specified that generated these results.
+
+#### Prior Predictive Distribution of the Reponse
+
+Next, we plot the predictive distribution of the responses vs. the predictor.
+
+```{r pri_pchk, eval = COMPUTATION}
+mod0_sim %>%
+  {
+    pp_check( ., 
+              type = "intervals", 
+              x = "x", 
+              newdata = filter(df_train,!is.na(y),!is.na(x))
+    ) +
+      labs( 
+        title = "Prior Predictive Check", 
+        subtitle = "Example: `mod0`" 
+      )
+  } %>%
+  print()
+
+```
+
+
+**And, there's the rub!** Some of the predicted values are almost 20 orders of magnitude too large!  Look at estimates for `Ymi` from the **R** chunk below.
+
+```{r show_miss_est, eval=COMPUTATION }
+pri_sim_df <- as_tibble( mod0_sim ) %>%
+  mutate(iter = row_number()) %>%
+  pivot_longer(
+    cols = starts_with("Ym"),
+    names_to = "case",
+    values_to = "Ymi"
+  ) %>%
+  mutate(case = gsub("[^0-9]","",case) %>% as.integer())
+
+summary( pri_sim_df$Ymi )
+```
+
+In this particular case, the latent values being estimated, `Ymi`, are for the response only, so they don't have an impact on the prior predictive checking plot.  But, in the case below, when the latent values are used as predictors of other quantities, the fact that `brms` is not placing the prior we thought we specified for these quantities -- by way of placing priors on the intercept, coefficients, and error terms has unfortunate consequences.
+
+## Model Specification with Missing Values for Predictor
+
+Here, we'll see what happens when we sprinkle a few missing values among the `x` values:
+
+```{r missing_x, eval= COMPUTATION}
+mod1_frm <- mvbf(
+  bf( x | mi() ~  1, family = gaussian(link = "identity")),
+  bf( y | mi() ~  mi(x), family = gaussian(link = "identity")),
+  rescor = FALSE
+)
+
+get_prior( 
+  formula = mod1_frm,
+  data    = df_train
+) %>% print()
+
+# Let's place a gamma prior on sigma. Our function `gamma_prior()`
+# allows us to specify a mean value for sigma and a standard deviation
+# in terms of what percentage of the mean we'd like it to be:
+sigma_prior_info <- gamma_prior( mn = 0.1, sd_pct = 50) %T>% print()
+
+priors1 <- c(
+  set_prior("student_t(4,0,1)", class = "Intercept" , resp = "x"),
+  set_prior( "normal(0.1,1.0e-5)", class = "sigma" , resp = "x"), # pin for identifiability
+  set_prior("lognormal(0.0,1.0)", class = "b", lb = 0 , resp = "y"),
+  set_prior("student_t(4,0,1)", class = "Intercept" , resp = "y"),
+  set_prior( sigma_prior_info$prior, class = "sigma" , resp = "y")
+) %T>% print()
+
+```
+
+### Prior Predictive Checking
+
+Now, let's assess these priors.
+
+#### Prior Predictive Simulation
+
+First, simulate the responses.
+
+
+```{r pri_sim1, eval = COMPUTATION}
+
+mod1_sim <- suppressMessages(
+  suppressWarnings(
+    brm(
+      formula = mod1_frm,
+      data    = df_train,
+      prior   = priors1,
+      chain   = 1,
+      sample_prior = "only",
+      warmup  = 1000,
+      iter    = 2000,
+      seed    = rng_seed + 0,
+      save_pars = save_pars( latent = TRUE )
+    )    
+  )
+)
+```
+
+```{r prnt_sim1, eval = COMPUTATION}
+print( mod1_sim, priors = TRUE, digits = 4 )
+```
+
+
+#### Prior Predictive Distribution of the Reponse
+
+Now, plot the predictive distributions for the response variable.
+
+```{r pri_pchk1, eval = COMPUTATION}
+mod1_sim %>%
+  {
+    pp_check( ., 
+              type = "intervals", 
+              x = "x", 
+              resp = "y",
+              newdata = filter(df_train,!is.na(y),!is.na(x))
+    ) +
+      labs( 
+        title = "Prior Predictive Check", 
+        subtitle = "Example: `mod1`" 
+      )
+  } %>%
+  print()
+
+```
+
+
+And, check out some of the statistics on the underlying latent variables.
+
+
+```{r show_miss_est1, eval=COMPUTATION }
+pri_sim1_df <- as_tibble( mod1_sim ) %>%
+  mutate(iter = row_number()) %>%
+  pivot_longer(
+    cols      = starts_with("Ymi"),
+    names_to  = "par",
+    values_to = "val"
+  ) %>%
+  mutate(case = gsub("[^0-9]+","",par) %>% as.integer())
+
+summary( pri_sim1_df$par )
+```
+
+
+## Examination of the Auto-Generated **Stan** Program
+
+We can figure out what's going on by looking at the **Stan** program that package `brms` automatically generates for this problem.
+
+```{r wrt_stn,eval=COMPUTATION}
+write_lines(x=stancode(mod1_sim),file = "mod1.stan")
+```
+
+```{stan,output.var="sm", code=xfun::read_utf8('mod1.stan'),eval=COMPUTATION}
+```
+
+**ISSUE:**  The issue is that the auto-generated **Stan** program encloses too much of the code within the `if(!prior_only){}` statement. The statements in that block serve as **dual-role statements**: They (1) implicitly place priors on `Ymi_x` & `Ymi_y`, thru `Yl_x[Jmi_x]` & `Yl_y[Jmi_y]`, which have missing values; while (2) serving as likelihoods using the remaining elements of `Yl_x` & `Yl_y`, which have observations. As a consequence, when we specify `prior_only = TRUE` in the call to function `brms::brm()`, we don't execute those statments and end up defaulting to the implicit flat prior on the latent values `Ymi_x` and `Ymi_y` for the missing quantities.
+
+
+
+## Examination of the Manually-Edited **Stan** Program with a Fix
+
+Here, in the manually-edited **Stan** program (file `mod1_fix.stan`), we fix this issue by strictly separating those dual-role statements as the sole entries within the `!prior_only` block of code and adding within the `prior_only` block of code some explicit priors (rather than the implicit default flat priors) on the latent variable estimating values to replace missing values, i.e., `normal_lpdf(Ymi_x | mu_x, sigma_x)` and `normal_lpdf(Ymi_y | mu_y, sigma_y)`.
+
+
+```{stan,output.var="sm", code=xfun::read_utf8('mod1_fix.stan'),eval=COMPUTATION}
+```
+
+
+## Prior & Posterior Checking with the Fixed Model
+
+Finally, let's run through the prior predictive checking, posterior estimation, and posterior predictive checking using the manually-edited **Stan** program.
+
+### Simulation
+
+```{r fixed, eval=COMPUTATION}
+# ADAPTED FROM THE HELP EXAMPLE FOR brms::brm():
+# fit a model manually via rstan
+
+sdata <- make_standata(
+  formula = mod1_frm, 
+  data    = df_train, 
+  prior   = priors1, 
+  sample_prior = "only" 
+)
+
+stansim <- rstan::stan(
+  file    = "mod1_fix.stan", 
+  data    = sdata,
+  chain   = 1,
+  warmup  = 1000,
+  iter    = 2000,
+  seed    = rng_seed + 100
+)
+# feed the Stan model back into brms
+mod1fix_sim <- suppressMessages(
+  suppressWarnings(
+    brm( 
+      mod1_frm, 
+      data  = df_train, 
+      prior = priors1, 
+      sample_prior = "only", 
+      empty = TRUE 
+    )
+  )
+)
+
+mod1fix_sim$fit <- stansim
+mod1fix_sim <- rename_pars(mod1fix_sim)
+
+```
+
+### Prior Predictive Checking
+
+```{r pri_chk_1,eval=COMPUTATION}
+
+print(mod1fix_sim, priors = TRUE, digits =4)
+
+pp_check(mod1fix_sim,type="intervals",x="x", resp="y") +
+  labs(title="Prior Predictive Check", subtitle="Example: `mod1fix`")
+```
+
+
+### Posterior Estimation
+
+```{r do_post,eval=COMPUTATION}
+# Perform prior simulation for prior predictive checking.
+mod1fix_fit <- suppressMessages(
+  suppressWarnings(
+    update( 
+      mod2fix_sim, 
+      sample_prior = "no", 
+      chains = 3, 
+      cores  = 3,
+      warmup = 1000,
+      iter   = 2000,
+      seed    = rng_seed + 200,
+      save_pars = save_pars(latent = TRUE, group = FALSE)
+    )
+  )
+)
+```
+
+
+### Posterior Predictive Checking
+
+```{r pst_chk_1, eval=COMPUTATION}
+# Posterior evaluation and posterior predictive checking.
+print(mod1fix_fit, priors = TRUE, digits =4)
+
+pp_check(mod1fix_fit,type="intervals",x="x", resp="y") +
+  labs(title="Posterior Predictive Check", subtitle="Example: `mod1fix`")
+
+```
+
+
+## Recommendation
+
+I recommend that the fix, as shown in the manually-edited **Stan** program `mod1_fix.stan`, be implemented in the next version of the **R** package `brms`.
+
+## About
+
+-Michael L. Thompson
+
+[*LinkedIn profile*](http://www.linkedin.com/in/fixhomps)
+
+[*Google Scholar page*](https://scholar.google.com/citations?user=TCTN05QAAAAJ)
+
+
+
